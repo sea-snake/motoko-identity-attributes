@@ -1,43 +1,35 @@
 # identity-attributes
 
-Motoko library for verifying Internet Identity attribute bundles in
-relying-party canisters. Pairs with `@icp-sdk/auth` v7's
-`requestAttributes` / `AttributesIdentity` flow.
+Verify Internet Identity attribute bundles in relying-party canisters.
+Pairs with `@icp-sdk/auth` v7.
 
 ## Install
 
-`mops.toml`:
-
 ```toml
+# mops.toml
 [dependencies]
 identity-attributes = "0.4.0"
 core                = "2.5.0"
 ```
 
-`icp.yaml` — list the Internet Identity backend as a trusted signer
-and configure the frontend origins every bundle must match. Optionally
-list SSO domains the canister trusts:
+Set the canister's environment variables in `icp.yaml`:
 
 ```yaml
 canisters:
   - name: backend
     settings:
       environment_variables:
-        trusted_attribute_signers: "rdmx6-jaaaa-aaaaa-aaadq-cai"
-        frontend_origins:          "https://your-app.icp0.io"
-        trusted_sso_domains:       "dfinity.org"
+        trusted_attribute_signers: "rdmx6-jaaaa-aaaaa-aaadq-cai"  # II backend principal (required)
+        frontend_origins:          "https://your-app.icp0.io"     # allowed origins, comma-separated (required)
+        trusted_sso_domains:       "dfinity.org"                  # comma-separated, optional (omit to reject all sso:* keys)
 ```
 
-`frontend_origins` is comma-separated — an app served from multiple
-domains lists each one. `trusted_sso_domains` is optional; leave it
-out and the canister accepts no `sso:*` keys.
+## Backend
 
-## Usage
-
-The library is a mixin — `include` it inside your `persistent actor`
-and it injects the two canister methods the frontend talks to. Your
-only job is the `onVerified` callback that runs once the bundle has
-been verified.
+Add the mixin to your `persistent actor` with `include`. It injects the
+two sign-in methods the frontend calls and runs your `onVerified`
+callback on each verified bundle. What the callback does is yours to
+decide. The example below keeps a profile per principal.
 
 ```motoko
 import IdentityAttributes "mo:identity-attributes";
@@ -45,37 +37,85 @@ import Map        "mo:core/Map";
 import Principal  "mo:core/Principal";
 
 persistent actor {
-  // User profiles keyed by principal. Populated from verified II
-  // attribute bundles by the callback below.
-  let profiles = Map.empty<Principal, { name : ?Text; email : ?Text; sso : ?Text }>();
+  type Profile = { name : ?Text; email : ?Text; sso : ?Text };
+
+  let profiles = Map.empty<Principal, Profile>();
 
   include IdentityAttributes({
     onVerified = func(caller, attrs) {
-      Map.add(profiles, Principal.compare, caller, attrs)
+      let profile : Profile = { name = attrs.name; email = attrs.email; sso = attrs.sso };
+      profiles.add(caller, profile)
     };
   });
 
-  public query func getProfile(p : Principal) : async ?{ name : ?Text; email : ?Text; sso : ?Text } {
-    Map.get(profiles, Principal.compare, p)
+  public query func getProfile(caller : Principal) : async ?Profile {
+    profiles.get(caller)
   };
 };
 ```
 
-The `include` call adds two `public shared` methods to your actor:
+## Frontend
 
+Fetch a nonce, request the bundle, replay it wrapped in an
+`AttributesIdentity`. Passing the nonce as a promise lets sign-in and the
+attribute request run together, so the user sees a single II prompt.
+
+```typescript
+import { AuthClient }         from "@icp-sdk/auth/client";
+import { AttributesIdentity } from "@icp-sdk/core/identity";
+import { HttpAgent, Actor }   from "@icp-sdk/core/agent";
+import { Principal }          from "@icp-sdk/core/principal";
+
+const authClient = new AuthClient();
+
+// Anonymous handle, used only to fetch the nonce.
+const anonymousAgent = await HttpAgent.create();
+const anonymousActor = Actor.createActor(idl, { agent: anonymousAgent, canisterId });
+
+// Nonce, sign-in, and attributes run in parallel.
+const noncePromise      = anonymousActor._internet_identity_sign_in_start();
+const signInPromise     = authClient.signIn();
+const attributesPromise = authClient.requestAttributes({
+  keys:  ["name", "verified_email"], // see "Requesting keys" below
+  nonce: noncePromise,
+});
+
+const identity   = await signInPromise;
+const attributes = await attributesPromise;
+
+// Wrap so the bundle travels as sender_info (signer is the trusted II canister).
+const verifiedAgent = await HttpAgent.create({
+  identity: new AttributesIdentity({
+    inner:  identity,
+    attributes,
+    signer: { canisterId: Principal.fromText("rdmx6-jaaaa-aaaaa-aaadq-cai") },
+  }),
+});
+const verifiedActor = Actor.createActor(idl, { agent: verifiedAgent, canisterId });
+
+const result = await verifiedActor._internet_identity_sign_in_finish(); // #ok once onVerified has run
 ```
-_internet_identity_sign_in_start()  : async Blob
-_internet_identity_sign_in_finish() : async Result<(), IdentityAttributesError>
+
+### Requesting keys
+
+The `keys` array lists the II attribute keys to request. This library reads two of them:
+
+- **name**: `name`, `openid:<provider>:name`, or `sso:<domain>:name`
+- **email**: `verified_email`, `openid:<provider>:verified_email`, or `sso:<domain>:email`
+
+Where:
+
+- `<provider>` is `https://accounts.google.com`, `https://appleid.apple.com`, or `https://login.microsoftonline.com/{tid}/v2.0` (`{tid}` is literal).
+- `<domain>` is one of `trusted_sso_domains`.
+
+Use `scopedKeys` from `@icp-sdk/auth/client` to build the scoped key
+forms. For example, scoping to Google:
+
+```typescript
+scopedKeys({ openIdProvider: "google", keys: ["name", "verified_email"] })
+// returns ["openid:https://accounts.google.com:name",
+//          "openid:https://accounts.google.com:verified_email"]
 ```
-
-Frontend flow:
-
-1. Call `_internet_identity_sign_in_start` anonymously before sign-in to get a 32-byte
-   nonce.
-2. Pass it to `authClient.requestAttributes({ nonce, keys: ["name", "verified_email"] })`.
-3. Wrap the resulting `SignedAttributes` into an `AttributesIdentity`
-   and call `_internet_identity_sign_in_finish`. On `#ok` the actor's `onVerified`
-   callback has already run; the FE can now call your other methods.
 
 ## API
 
@@ -84,7 +124,7 @@ include IdentityAttributes({
   onVerified : (Principal, { name : ?Text; email : ?Text; sso : ?Text }) -> ()
 });
 
-// Injected on the consumer actor:
+// Injected on your actor:
 _internet_identity_sign_in_start()  : async Blob
 _internet_identity_sign_in_finish() : async Result<(), IdentityAttributesError>
 
@@ -102,25 +142,16 @@ type IdentityAttributesError = {
 };
 ```
 
-`name` and `email` are each sourced from at most one key in the
-bundle, drawn from a single category:
+Your `onVerified` callback receives the caller and the resolved
+`{ name; email; sso }`. The `sso` field is the matched domain when
+name/email came from `sso:` keys, otherwise `null`.
 
-- **unscoped / openid** — `name` / `verified_email`, or
-  `openid:<provider>:name` / `openid:<provider>:verified_email`.
-  Only `verified_email`-suffixed keys are exposed; the unverified
-  `email` key is never read.
-- **sso** — `sso:<domain>:name` / `sso:<domain>:email`, where
-  `<domain>` is one of the canister's `trusted_sso_domains`. The
-  IdP behind `<domain>` attests the email, so it has no separate
-  verification flag and its own domain may be anything.
+Resolution rules:
 
-If the bundle contains two or more candidates for the same field,
-`_internet_identity_sign_in_finish` returns `#AmbiguousAttribute`
-rather than silently picking one. SSO and non-SSO sources never mix
-in a single bundle — mixing yields `#MixedSsoSources`. An
-`sso:<domain>:*` key whose domain isn't trusted rejects the bundle
-with `#UntrustedSsoSource`. When the bundle's name/email came from
-SSO keys, `attrs.sso` is the matched domain; otherwise it's `null`.
+- Each field resolves from at most one key. Two candidates returns `#AmbiguousAttribute`.
+- A bundle may carry both non-SSO and SSO keys, but the two are never combined: a mixed bundle is rejected with `#MixedSsoSources`.
+- An untrusted `sso:<domain>:*` key rejects the whole bundle with `#UntrustedSsoSource`.
+- Non-SSO email comes from `verified_email`. SSO email comes from `sso:<domain>:email`.
 
 ## Compatibility
 
@@ -128,11 +159,6 @@ SSO keys, `attrs.sso` is the matched domain; otherwise it's `null`.
 |---|---|
 | `^0.4` | `^7` |
 | `^0.3` | `^7` |
-
-## Demos
-
-- [`demos/bagel/`](demos/bagel/) — pair-for-coffee canister, gated by Internet Identity attributes.
-- [`demos/dfinsight/`](demos/dfinsight/) — feedback board with an attribute-gated admin role.
 
 ## License
 
